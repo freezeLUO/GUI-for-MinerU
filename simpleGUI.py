@@ -1,203 +1,192 @@
 import os
-import json
-from tkinter import Tk, Button, Label, Entry, filedialog, StringVar, OptionMenu, Text, Scrollbar, END
-from tkinter.scrolledtext import ScrolledText
-from loguru import logger
-from magic_pdf.pipe.UNIPipe import UNIPipe
-from magic_pdf.rw.DiskReaderWriter import DiskReaderWriter
-import magic_pdf.model as model_config
-import sys
-from contextlib import redirect_stdout, redirect_stderr
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 import threading
 
-# 设置使用内部模型
-model_config.__use_inside_model__ = True
+# 导入 tkinterdnd2 用于拖放支持
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:
+    messagebox.showerror("缺少库", "请安装 tkinterdnd2 库: pip install tkinterdnd2")
+    raise
 
-class PDFToMarkdownConverter:
+from magic_pdf.data.data_reader_writer import FileBasedDataWriter, FileBasedDataReader
+from magic_pdf.data.dataset import PymuDocDataset
+from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
+from magic_pdf.config.enums import SupportedPdfParseMethod
+
+class PDFtoMarkdownGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("PDF to Markdown Converter")
+        self.root.title("PDF 转 Markdown 工具")
+        self.root.geometry("700x500")
+        self.root.resizable(False, False)  # 不允许拉伸窗口
+        self.create_widgets()
 
-        self.config_path = None
-        self.pdf_path = None
+    def create_widgets(self):
+        style = ttk.Style()
+        style.theme_use("clam")  # 设置主题
+        style.configure(".", font=("Microsoft YaHei", 10))  # 设置全局字体
+        style.configure("TLabelFrame", font=("Microsoft YaHei", 11, "bold"), padding=10)
 
-        # 配置变量
-        self.bucket_info = StringVar()
-        self.temp_output_dir = StringVar()
-        self.models_dir = StringVar()
-        self.device_mode = StringVar()
+        padding = {'padx': 10, 'pady': 10}
 
-        # 设置GUI
-        self.setup_gui()
+        # PDF文件选择区域
+        self.pdf_path = tk.StringVar()
+        pdf_frame = ttk.LabelFrame(self.root, text="选择PDF文件")
+        pdf_frame.grid(row=0, column=0, columnspan=3, sticky='we', **padding)
 
-        # 设置日志
-        self.setup_logging()
+        # 拖放区域
+        self.drop_area = tk.Label(pdf_frame, text="将PDF文件拖放到这里", relief='ridge', width=60, height=5, bg='lightgray')
+        self.drop_area.pack(padx=10, pady=10)
+        self.drop_area.drop_target_register(DND_FILES)
+        self.drop_area.dnd_bind('<<Drop>>', self.drop_pdf)
 
-    def setup_gui(self):
-        # 选择配置文件按钮
-        Button(self.root, text="选择 magic-pdf.json 文件", command=self.select_magic_pdf_file).pack(pady=10)
+        # 或者使用按钮选择文件
+        button_frame = tk.Frame(pdf_frame)
+        button_frame.pack(pady=5)
+        tk.Button(button_frame, text="浏览文件", command=self.browse_pdf).pack()
 
-        # 配置文件标签
-        self.config_label = Label(self.root, text="未选择配置文件")
-        self.config_label.pack(pady=10)
+        # 输出目录选择
+        self.output_dir = tk.StringVar()  # 原先为 "output"
+        output_frame = ttk.LabelFrame(self.root, text="选择输出目录")
+        output_frame.grid(row=1, column=0, columnspan=3, sticky='we', **padding)
 
-        # 配置输入字段
-        self.create_labeled_entry("Bucket 信息:", self.bucket_info)
-        self.create_labeled_entry("临时输出目录:", self.temp_output_dir, self.select_temp_output_dir)
-        self.create_labeled_entry("模型目录:", self.models_dir, self.select_models_dir)
-
-        Label(self.root, text="设备模式:").pack(pady=5)
-        OptionMenu(self.root, self.device_mode, "cuda", "cpu").pack(pady=5)
-
-        # 保存配置按钮
-        Button(self.root, text="保存配置", command=self.save_config).pack(pady=10)
-
-        # 选择PDF文件按钮
-        Button(self.root, text="选择PDF文件", command=self.select_file).pack(pady=10)
-
-        # 文件标签
-        self.file_label = Label(self.root, text="未选择文件")
-        self.file_label.pack(pady=10)
+        tk.Entry(output_frame, textvariable=self.output_dir, width=60).pack(side='left', padx=10, pady=10)
+        tk.Button(output_frame, text="浏览", command=self.browse_output_dir).pack(side='left', padx=10, pady=10)
 
         # 转换按钮
-        Button(self.root, text="转换为Markdown", command=self.start_conversion).pack(pady=10)
+        self.convert_button = tk.Button(self.root, text="开始转换", command=self.start_conversion, bg='blue', fg='white', font=('Arial', 12, 'bold'))
+        self.convert_button.grid(row=2, column=1, **padding)
 
-        # 结果标签
-        self.result_label = Label(self.root, text="")
-        self.result_label.pack(pady=10)
+        # 进度显示
+        self.progress = ttk.Progressbar(self.root, orient='horizontal', mode='indeterminate')
+        self.progress.grid(row=3, column=0, columnspan=3, sticky='we', **padding)
 
-        # 日志文本框
-        self.log_text = ScrolledText(self.root, height=10)
-        self.log_text.pack(pady=10, fill='both', expand=True)
+        # 日志输出
+        log_frame = ttk.LabelFrame(self.root, text="日志")
+        log_frame.grid(row=4, column=0, columnspan=3, sticky='nsew', **padding)
+        self.log_text = tk.Text(log_frame, height=15, state='disabled', wrap='word')
+        self.log_text.pack(fill='both', expand=True, padx=10, pady=10)
 
-    def setup_logging(self):
-        # 设置日志记录器
-        logger.remove()
-        logger.add(self.log_text_write, level="DEBUG")
+        # 配置网格权重以使日志区域可扩展
+        self.root.grid_rowconfigure(4, weight=1)
+        self.root.grid_columnconfigure(2, weight=1)
 
-        # 重定向标准输出和标准错误
-        sys.stdout = self.log_text_writer()
-        sys.stderr = self.log_text_writer()
+    def browse_pdf(self):
+        file_path = filedialog.askopenfilename(
+            title="选择PDF文件",
+            filetypes=[("PDF Files", "*.pdf")]
+        )
+        if file_path:
+            self.pdf_path.set(file_path)
+            self.output_dir.set(os.path.dirname(file_path))  # 新增：默认输出目录为PDF所在目录
+            self.log(f"选择的PDF文件: {file_path}")
 
-    def log_text_write(self, message):
-        # 将日志消息写入文本框
-        self.log_text.insert(END, message)
-        self.log_text.see(END)  # 自动滚动到末尾
+    def browse_output_dir(self):
+        directory = filedialog.askdirectory(title="选择输出目录")
+        if directory:
+            self.output_dir.set(directory)
+            self.log(f"选择的输出目录: {directory}")
 
-    def log_text_writer(self):
-        # 创建一个文本重定向器类
-        class TextRedirector:
-            def __init__(self, text_widget):
-                self.text_widget = text_widget
-
-            def write(self, message):
-                self.text_widget.insert(END, message)
-                self.text_widget.see(END)
-
-            def flush(self):
-                pass  # 如果代码调用 sys.stdout.flush()，则需要此方法
-
-        return TextRedirector(self.log_text)
-
-    def create_labeled_entry(self, label_text, var, button_command=None):
-        # 创建带标签的输入框
-        Label(self.root, text=label_text).pack(pady=5)
-        if button_command:
-            Button(self.root, text="选择目录", command=button_command).pack(pady=5)
-        Entry(self.root, textvariable=var, width=50).pack(pady=5)
-
-    def select_magic_pdf_file(self):
-        # 选择配置文件
-        self.config_path = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
-        if self.config_path:
-            with open(self.config_path, 'r') as f:
-                config_data = json.load(f)
-            self.bucket_info.set(json.dumps(config_data.get("bucket_info", {}), indent=4))
-            self.temp_output_dir.set(config_data.get("temp-output-dir", ""))
-            self.models_dir.set(config_data.get("models-dir", ""))
-            self.device_mode.set(config_data.get("device-mode", "cpu"))
-            self.config_label.config(text=f"已选择配置文件: {self.config_path}")
-
-    def save_config(self):
-        # 保存配置文件
-        config_data = {
-            "bucket_info": json.loads(self.bucket_info.get()),
-            "temp-output-dir": self.temp_output_dir.get(),
-            "models-dir": self.models_dir.get(),
-            "device-mode": self.device_mode.get()
-        }
-        if self.config_path:
-            with open(self.config_path, 'w') as f:
-                json.dump(config_data, f, indent=4)
-            self.result_label.config(text="配置已保存!")
-
-    def select_file(self):
-        # 选择PDF文件
-        self.pdf_path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
-        if self.pdf_path:
-            self.file_label.config(text=f"已选择文件: {self.pdf_path}")
-            self.temp_output_dir.set(os.path.dirname(self.pdf_path))  # 自动设置临时输出目录为PDF所在路径
+    def drop_pdf(self, event):
+        # 获取拖放的文件路径，支持多个文件
+        files = self.root.splitlist(event.data)
+        for file in files:
+            if file.lower().endswith('.pdf'):
+                self.pdf_path.set(file)
+                self.output_dir.set(os.path.dirname(file))  # 新增：默认输出目录为PDF所在目录
+                self.log(f"拖放的PDF文件: {file}")
+                break
+            else:
+                self.log(f"忽略非PDF文件: {file}")
 
     def start_conversion(self):
-        # 启动转换线程
-        conversion_thread = threading.Thread(target=self.convert_file)
-        conversion_thread.start()
+        pdf_file = self.pdf_path.get()
+        output_dir = self.output_dir.get()
 
-    def convert_file(self):
-        # 转换文件
-        if not self.pdf_path:
-            self.result_label.config(text="未选择PDF文件!")
+        if not pdf_file:
+            messagebox.showwarning("输入错误", "请先选择一个PDF文件。")
             return
-    
+
+        if not os.path.isfile(pdf_file):
+            messagebox.showerror("文件错误", "选择的PDF文件不存在。")
+            return
+
+        if not pdf_file.lower().endswith('.pdf'):
+            messagebox.showerror("文件类型错误", "请选择一个PDF文件。")
+            return
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 禁用按钮并启动进度条
+        self.convert_button.config(state='disabled')
+        self.progress.start()
+        self.log("开始转换...")
+
+        # 使用线程避免阻塞GUI
+        threading.Thread(target=self.convert_pdf_to_md, args=(pdf_file, output_dir), daemon=True).start()
+
+    def convert_pdf_to_md(self, pdf_file, output_dir):
         try:
-            # 获取PDF文件所在目录
-            pdf_dir = os.path.dirname(self.pdf_path)
-            demo_name = os.path.splitext(os.path.basename(self.pdf_path))[0]
-            pdf_bytes = open(self.pdf_path, "rb").read()
-            
-            model_json = []  # model_json传空list使用内置模型解析
-            jso_useful_key = {"_pdf_type": "", "model_list": model_json}
-            
-            local_image_dir = os.path.join(pdf_dir, 'images')
-            image_writer = DiskReaderWriter(local_image_dir)
-            
-            pipe = UNIPipe(pdf_bytes, jso_useful_key, image_writer)
-            pipe.pipe_classify()
-            
-            if len(model_json) == 0:
-                if model_config.__use_inside_model__:
-                    pipe.pipe_analyze()
-                else:
-                    logger.error("需要模型列表输入")
-                    return
-            
-            pipe.pipe_parse()
-            md_content = pipe.pipe_mk_markdown(os.path.basename(local_image_dir), drop_mode="none")
-            
-            # 将Markdown文件保存在PDF文件的同一目录下
-            md_file_path = os.path.join(pdf_dir, f"{demo_name}.md")
-            with open(md_file_path, "w", encoding="utf-8") as f:
-                f.write(md_content)
-            
-            self.result_label.config(text="转换成功!")
+            name_without_suff = os.path.splitext(os.path.basename(pdf_file))[0]
+            local_image_dir = os.path.join(output_dir, "images")
+            local_md_dir = output_dir
+            os.makedirs(local_image_dir, exist_ok=True)
+
+            image_writer = FileBasedDataWriter(local_image_dir)
+            md_writer = FileBasedDataWriter(local_md_dir)
+
+            reader = FileBasedDataReader("")
+            pdf_bytes = reader.read(pdf_file)
+
+            ds = PymuDocDataset(pdf_bytes)
+
+            if ds.classify() == SupportedPdfParseMethod.OCR:
+                self.log("使用OCR解析PDF...")
+                infer_result = ds.apply(doc_analyze, ocr=True)
+                pipe_result = infer_result.pipe_ocr_mode(image_writer)
+            else:
+                self.log("使用文本模式解析PDF...")
+                infer_result = ds.apply(doc_analyze, ocr=False)
+                pipe_result = infer_result.pipe_txt_mode(image_writer)
+
+            # 绘制和保存结果
+            infer_result.draw_model(os.path.join(local_md_dir, f"{name_without_suff}_model.pdf"))
+            self.log(f"模型结果已保存: {name_without_suff}_model.pdf")
+
+            pipe_result.draw_layout(os.path.join(local_md_dir, f"{name_without_suff}_layout.pdf"))
+            self.log(f"布局结果已保存: {name_without_suff}_layout.pdf")
+
+            pipe_result.draw_span(os.path.join(local_md_dir, f"{name_without_suff}_spans.pdf"))
+            self.log(f"跨度结果已保存: {name_without_suff}_spans.pdf")
+
+            pipe_result.dump_md(md_writer, f"{name_without_suff}.md", "images")
+            self.log(f"Markdown 文件已保存: {name_without_suff}.md")
+
+            pipe_result.dump_content_list(md_writer, f"{name_without_suff}_content_list.json", "images")
+            self.log(f"内容列表已保存: {name_without_suff}_content_list.json")
+
+            self.log("转换完成！")
+            messagebox.showinfo("完成", "PDF 转 Markdown 转换完成。")
         except Exception as e:
-            logger.exception("转换失败!")
-            self.result_label.config(text="转换失败!")
+            self.log(f"转换过程中发生错误: {e}")
+            messagebox.showerror("错误", f"转换过程中发生错误:\n{e}")
+        finally:
+            self.progress.stop()
+            self.convert_button.config(state='normal')
 
-    def select_temp_output_dir(self):
-        # 选择临时输出目录
-        directory = filedialog.askdirectory()
-        if directory:
-            self.temp_output_dir.set(directory)
+    def log(self, message):
+        self.log_text.config(state='normal')
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.config(state='disabled')
 
-    def select_models_dir(self):
-        # 选择模型目录
-        directory = filedialog.askdirectory()
-        if directory:
-            self.models_dir.set(directory)
-
-# 运行应用程序
-if __name__ == "__main__":
-    root = Tk()
-    app = PDFToMarkdownConverter(root)
+def main():
+    # 使用 TkinterDnD 的 TkinterDnD.Tk 类代替 tk.Tk
+    root = TkinterDnD.Tk()
+    app = PDFtoMarkdownGUI(root)
     root.mainloop()
+
+if __name__ == "__main__":
+    main()
